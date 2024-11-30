@@ -121,17 +121,15 @@ func reserveLivestreamHandler(c echo.Context) error {
 		}
 	}
 
-	var (
-		livestreamModel = &LivestreamModel{
-			UserID:       int64(userID),
-			Title:        req.Title,
-			Description:  req.Description,
-			PlaylistUrl:  req.PlaylistUrl,
-			ThumbnailUrl: req.ThumbnailUrl,
-			StartAt:      req.StartAt,
-			EndAt:        req.EndAt,
-		}
-	)
+	livestreamModel := &LivestreamModel{
+		UserID:       int64(userID),
+		Title:        req.Title,
+		Description:  req.Description,
+		PlaylistUrl:  req.PlaylistUrl,
+		ThumbnailUrl: req.ThumbnailUrl,
+		StartAt:      req.StartAt,
+		EndAt:        req.EndAt,
+	}
 
 	if _, err := tx.ExecContext(ctx, "UPDATE reservation_slots SET slot = slot - 1 WHERE start_at >= ? AND end_at <= ?", req.StartAt, req.EndAt); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to update reservation_slot: "+err.Error())
@@ -507,16 +505,19 @@ func fillLivestreamResponse(ctx context.Context, tx *sqlx.Tx, livestreamModel Li
 		return Livestream{}, err
 	}
 
-	tags := make([]Tag, len(livestreamTagModels))
+	var tagIDs []int64
 	for i := range livestreamTagModels {
-		tagModel := TagModel{}
-		if err := tx.GetContext(ctx, &tagModel, "SELECT * FROM tags WHERE id = ?", livestreamTagModels[i].TagID); err != nil {
+		tagIDs = append(tagIDs, livestreamTagModels[i].TagID)
+	}
+	tags := make([]Tag, len(livestreamTagModels))
+	if len(tagIDs) > 0 {
+		query, params, err := sqlx.In("SELECT * FROM tags WHERE id IN (?)", tagIDs)
+		if err != nil {
 			return Livestream{}, err
 		}
-
-		tags[i] = Tag{
-			ID:   tagModel.ID,
-			Name: tagModel.Name,
+		query = tx.Rebind(query)
+		if err := tx.SelectContext(ctx, &tags, query, params...); err != nil {
+			return Livestream{}, err
 		}
 	}
 
