@@ -167,23 +167,14 @@ func getMeHandler(c echo.Context) error {
 	ctx := c.Request().Context()
 
 	if err := verifyUserSession(c); err != nil {
-		// echo.NewHTTPErrorが返っているのでそのまま出力
 		return err
 	}
 
-	// error already checked
 	sess, _ := session.Get(defaultSessionIDKey, c)
-	// existence already checked
 	userID := sess.Values[defaultUserIDKey].(int64)
 
-	tx, err := dbConn.BeginTxx(ctx, nil)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to begin transaction: "+err.Error())
-	}
-	defer tx.Rollback()
-
-	userModel := UserModel{}
-	err = tx.GetContext(ctx, &userModel, "SELECT * FROM users WHERE id = ?", userID)
+	var userModel UserModel
+	err := dbConn.GetContext(ctx, &userModel, "SELECT * FROM users WHERE id = ?", userID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return echo.NewHTTPError(http.StatusNotFound, "not found user that has the userid in session")
 	}
@@ -191,13 +182,9 @@ func getMeHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
 	}
 
-	user, err := fillUserResponse(ctx, tx, userModel)
+	user, err := fillUserResponse(ctx, dbConn, userID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fill user: "+err.Error())
-	}
-
-	if err := tx.Commit(); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
 	}
 
 	return c.JSON(http.StatusOK, user)
@@ -260,7 +247,7 @@ func registerHandler(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, string(out)+": "+err.Error())
 	}
 
-	user, err := fillUserResponse(ctx, tx, userModel)
+	user, err := fillUserResponse(ctx, dbConn, userID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fill user: "+err.Error())
 	}
@@ -341,39 +328,29 @@ func loginHandler(c echo.Context) error {
 // GET /api/user/:username
 func getUserHandler(c echo.Context) error {
 	ctx := c.Request().Context()
+
 	if err := verifyUserSession(c); err != nil {
-		// echo.NewHTTPErrorが返っているのでそのまま出力
 		return err
 	}
 
 	username := c.Param("username")
 
-	tx, err := dbConn.BeginTxx(ctx, nil)
+	var userID int64
+	err := dbConn.GetContext(ctx, &userID, "SELECT id FROM users WHERE name = ?", username)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to begin transaction: "+err.Error())
-	}
-	defer tx.Rollback()
-
-	userModel := UserModel{}
-	if err := tx.GetContext(ctx, &userModel, "SELECT * FROM users WHERE name = ?", username); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return echo.NewHTTPError(http.StatusNotFound, "not found user that has the given username")
 		}
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user: "+err.Error())
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get user ID: "+err.Error())
 	}
 
-	user, err := fillUserResponse(ctx, tx, userModel)
+	user, err := fillUserResponse(ctx, dbConn, userID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to fill user: "+err.Error())
 	}
 
-	if err := tx.Commit(); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to commit: "+err.Error())
-	}
-
 	return c.JSON(http.StatusOK, user)
 }
-
 func verifyUserSession(c echo.Context) error {
 	sess, err := session.Get(defaultSessionIDKey, c)
 	if err != nil {
@@ -398,32 +375,65 @@ func verifyUserSession(c echo.Context) error {
 	return nil
 }
 
-func fillUserResponse(ctx context.Context, tx *sqlx.Tx, userModel UserModel) (User, error) {
-	themeModel := ThemeModel{}
-	if err := tx.GetContext(ctx, &themeModel, "SELECT * FROM themes WHERE user_id = ?", userModel.ID); err != nil {
-		return User{}, err
+func fillUserResponse(ctx context.Context, db *sqlx.DB, userID int64) (User, error) {
+	query := `
+        SELECT 
+            u.id AS user_id, 
+            u.name AS user_name, 
+            u.display_name AS user_display_name, 
+            u.description AS user_description,
+            t.id AS theme_id, 
+            t.dark_mode AS theme_dark_mode,
+            i.image AS icon_image
+        FROM 
+            users u
+        INNER JOIN 
+            themes t ON t.user_id = u.id
+        LEFT JOIN 
+            icons i ON i.user_id = u.id
+        WHERE 
+            u.id = ?
+    `
+
+	// 結果をマッピングする構造体
+	type resultRow struct {
+		UserID      int64  `db:"user_id"`
+		UserName    string `db:"user_name"`
+		DisplayName string `db:"user_display_name"`
+		Description string `db:"user_description"`
+		ThemeID     int64  `db:"theme_id"`
+		DarkMode    bool   `db:"theme_dark_mode"`
+		IconImage   []byte `db:"icon_image"`
+	}
+
+	var row resultRow
+	if err := db.GetContext(ctx, &row, query, userID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, echo.NewHTTPError(http.StatusNotFound, "user not found")
+		}
+		return User{}, echo.NewHTTPError(http.StatusInternalServerError, "failed to fetch user data: "+err.Error())
 	}
 
 	var image []byte
-	if err := tx.GetContext(ctx, &image, "SELECT image FROM icons WHERE user_id = ?", userModel.ID); err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return User{}, err
-		}
+	if row.IconImage != nil {
+		image = row.IconImage
+	} else {
+		var err error
 		image, err = os.ReadFile(fallbackImage)
 		if err != nil {
-			return User{}, err
+			return User{}, echo.NewHTTPError(http.StatusInternalServerError, "failed to read fallback image: "+err.Error())
 		}
 	}
 	iconHash := sha256.Sum256(image)
 
 	user := User{
-		ID:          userModel.ID,
-		Name:        userModel.Name,
-		DisplayName: userModel.DisplayName,
-		Description: userModel.Description,
+		ID:          row.UserID,
+		Name:        row.UserName,
+		DisplayName: row.DisplayName,
+		Description: row.Description,
 		Theme: Theme{
-			ID:       themeModel.ID,
-			DarkMode: themeModel.DarkMode,
+			ID:       row.ThemeID,
+			DarkMode: row.DarkMode,
 		},
 		IconHash: fmt.Sprintf("%x", iconHash),
 	}
