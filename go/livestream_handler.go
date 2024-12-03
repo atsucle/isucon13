@@ -197,14 +197,24 @@ func searchLivestreamsHandler(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusInternalServerError, "failed to get keyTaggedLivestreams: "+err.Error())
 		}
 
+		var livestreamIDs []int
 		for _, keyTaggedLivestream := range keyTaggedLivestreams {
-			ls := LivestreamModel{}
-			if err := tx.GetContext(ctx, &ls, "SELECT * FROM livestreams WHERE id = ?", keyTaggedLivestream.LivestreamID); err != nil {
-				return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestreams: "+err.Error())
+			livestreamIDs = append(livestreamIDs, int(keyTaggedLivestream.LivestreamID))
+		}
+
+		var livestreamModels []*LivestreamModel
+		if len(livestreamIDs) > 0 {
+			query, params, err := sqlx.In("SELECT * FROM livestreams WHERE id IN (?)", livestreamIDs)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to construct IN query: "+err.Error())
 			}
 
-			livestreamModels = append(livestreamModels, &ls)
+			query = tx.Rebind(query)
+			if err := tx.SelectContext(ctx, &livestreamModels, query, params...); err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "failed to get livestreamModels: "+err.Error())
+			}
 		}
+
 	} else {
 		// 検索条件なし
 		query := `SELECT * FROM livestreams ORDER BY id DESC`
